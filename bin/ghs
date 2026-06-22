@@ -99,28 +99,29 @@ else
   v "combined → $unique unique repos ($(($(date +%s)-t0))s)"
 fi
 
-n_total=0; n_and=0; n_stars=0; n_date=0; n_pass=0
 t1=$(date +%s)
-jq -c '.[]' "$data_file" | while read -r repo; do
-  fn=$(jq -r '.fullName' <<<"$repo")
-  desc=$(jq -r '.description // ""' <<<"$repo")
-  stars=$(jq -r '.stargazersCount' <<<"$repo")
-  pushed=$(jq -r '.pushedAt' <<<"$repo")
-  url=$(jq -r '.url' <<<"$repo")
-  txt=$(echo "$fn $desc" | tr '[:upper:]' '[:lower:]')
-  ma=0
-  for term in "${terms[@]}"; do
-    tl=$(echo "$term" | tr '[:upper:]' '[:lower:]')
-    [[ "$txt" == *"$tl"* ]] && ((ma++))
-  done
-  r_and=✗; r_stars=✗; r_date=✗
-  [ "$ma" -eq "${#terms[@]}" ] && r_and=✓
-  [ "$stars" -gt "$min_stars" ] && r_stars=✓
-  [[ "$pushed" > "$since" || "$pushed" == "$since" ]] && r_date=✓
-  [ "$verbose" -eq 1 ] && printf "ghs:  %-42s AND %s stars %s date %s\n" "$fn" "$r_and" "$r_stars" "$r_date" >&2
-  [ "$r_and" = ✗ ] || [ "$r_stars" = ✗ ] || [ "$r_date" = ✗ ] && continue
-  echo "$stars|$fn|$desc|$url"
-done | sort -t'|' -k1 -rn | head -"$limit" | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data" &
+
+jq -r '
+  .[] | [.fullName, (.description // ""), .stargazersCount, .pushedAt, .url, (.fullName + " " + (.description // "") | ascii_downcase)]
+  | @tsv
+' "$data_file" | awk -F'\t' -v terms="${terms[*]}" -v min_stars="$min_stars" -v since="$since" -v verbose="$verbose" '
+BEGIN {
+  n = split(tolower(terms), ts, " ")
+  for (i = 1; i <= n; i++) ts[i] = ts[i]
+}
+{
+  and_ok = 1
+  txt = $6
+  for (i = 1; i <= n; i++) {
+    if (index(txt, ts[i]) == 0) { and_ok = 0; break }
+  }
+  star_ok = ($3 + 0 > min_stars + 0)
+  date_ok = ($4 >= since)
+  if (verbose) {
+    printf "ghs:  %-42s AND %s stars %s date %s\n", $1, (and_ok ? "✓" : "✗"), (star_ok ? "✓" : "✗"), (date_ok ? "✓" : "✗") > "/dev/stderr"
+  }
+  if (and_ok && star_ok && date_ok) print $3 "|" $1 "|" $2 "|" $5
+}' | sort -t'|' -k1 -rn | head -"$limit" | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data" &
 pid=$!
 wait "$pid" 2>/dev/null
 fzfc=$(wc -l < "$fzf_data" 2>/dev/null | tr -d ' ') || fzfc=0
