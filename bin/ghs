@@ -10,9 +10,45 @@ CACHE_TTL=300
 fzf_data=$(mktemp "${TMPDIR:-/tmp}/ghs_XXXXXX")
 trap 'rm -f "$fzf_data"' EXIT
 
-[ $# -ge 1 ] || { echo "Usage: ghs <term1> [term2] ..." >&2; exit 1; }
+pipe_mode=0
+json_mode=0
+verbose=0
+limit=100
+min_stars=1
+since="2025-01-01"
+sort_field="stars"
+terms=()
 
-terms=("$@")
+i=0
+while [ $i -lt $# ]; do
+  a="${@:$((i+1)):1}"
+  case "$a" in
+    --pipe|--no-fzf) pipe_mode=1 ;;
+    --flag) pipe_mode=1 ;;
+    --json) json_mode=1 ;;
+    --verbose|-v) verbose=1 ;;
+    --help|-h) echo "Usage: ghs [options] <term1> [term2] ..."
+              echo "Options:"
+              echo "  --flag, --pipe, --no-fzf   Print results to stdout (skip fzf)"
+              echo "  --json                     Print raw JSON"
+              echo "  -v, --verbose              Show search status on stderr"
+              echo "  --limit N                  Max results (default 100)"
+              echo "  --stars N                  Min stars filter (default 1)"
+              echo "  --since DATE               Push date filter (default 2025-01-01)"
+              echo "  --sort FIELD               Sort: stars/updated/forks (default stars)"
+              echo "  -h, --help                 This help"
+              exit 0 ;;
+    --limit) limit="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --stars) min_stars="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --since) since="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --sort) sort_field="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --*) echo "ghs: unknown flag $a" >&2; exit 1 ;;
+    *) terms+=("$a") ;;
+  esac
+  i=$((i+1))
+done
+
+[ ${#terms[@]} -ge 1 ] || { echo "ghs: at least one search term required" >&2; exit 1; }
 IFS=$'\n' sorted=($(sort <<<"${terms[*]}")); unset IFS
 cache_key=$(echo -n "${sorted[*]}" | md5 -q)
 cache_file="$CACHE_DIR/$cache_key.json"
@@ -28,16 +64,29 @@ fi
 
 find "$CACHE_DIR" -type f -mmin +$((CACHE_TTL / 60)) -delete 2>/dev/null || true
 
+SEARCH_LIMIT=500
+t0=$(date +%s)
+v() { [ "$verbose" -eq 1 ] && echo "ghs: $*" >&2; true; }
+
 if [ "$age" -gt "$CACHE_TTL" ]; then
+  v "cache miss, searching..."
   combined='[]'
   for term in "${terms[@]}"; do
-    result=$(gh search repos "$term" --sort stars --limit 200 \
+    result=$(gh search repos "$term" --sort "$sort_field" --limit "$SEARCH_LIMIT" \
       --json fullName,description,url,stargazersCount,pushedAt || echo '[]')
+    count=$(echo "$result" | jq length)
+    v "\"$term\" → $count repos"
     combined=$(jq -s 'add' <(echo "$combined") <(echo "$result"))
   done
+  unique=$(echo "$combined" | jq 'unique_by(.url) | length')
   echo "$combined" | jq 'unique_by(.url)' > "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file"
+  v "combined → $unique unique repos ($(($(date +%s)-t0))s)"
+else
+  unique=$(jq length "$cache_file" 2>/dev/null || echo 0)
+  v "cache hit, $unique repos (age $(($(date +%s)-$(stat -f %m "$cache_file" 2>/dev/null || echo $((now-1)))))s)"
 fi
 
+t1=$(date +%s)
 jq -c '.[]' "$cache_file" | while read -r repo; do
   fullName=$(jq -r '.fullName' <<<"$repo")
   desc=$(jq -r '.description // ""' <<<"$repo")
@@ -54,14 +103,23 @@ jq -c '.[]' "$cache_file" | while read -r repo; do
     fi
   done
   [ "$match_all" -eq "${#terms[@]}" ] || continue
-  [ "$stars" -gt 1 ] || continue
-  [[ "$pushed" > "2025-01-01" || "$pushed" == "2025-01-01" ]] || continue
+  [ "$stars" -gt "$min_stars" ] || continue
+  [[ "$pushed" > "$since" || "$pushed" == "$since" ]] || continue
   echo "$stars|$fullName|$desc|$url"
-done | sort -t'|' -k1 -rn | head -100 | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data"
+done | sort -t'|' -k1 -rn | head -"$limit" | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data"
+fzfc=$(wc -l < "$fzf_data" 2>/dev/null | tr -d ' ') || fzfc=0
+v "filtered → $fzfc results ($(($(date +%s)-t1))s)"
+v "total $(($(date +%s)-t0))s"
 
-while true; do
-  selected=$(fzf --ansi --with-nth=1..4 < "$fzf_data")
-  [ -n "$selected" ] || break
-  url=$(echo "$selected" | awk -F'\t' '{print $2}')
-  gh repo view --web "$url" 2>/dev/null || open "$url" 2>/dev/null || true
-done
+if [ "$json_mode" -eq 1 ]; then
+  cat "$cache_file"
+elif [ "$pipe_mode" -eq 1 ]; then
+  awk -F'\t' '{print $1}' "$fzf_data"
+else
+  while true; do
+    selected=$(fzf --ansi --with-nth=1..4 < "$fzf_data")
+    [ -n "$selected" ] || break
+    url=$(echo "$selected" | awk -F'\t' '{print $2}')
+    gh repo view --web "$url" 2>/dev/null || open "$url" 2>/dev/null || true
+  done
+fi
