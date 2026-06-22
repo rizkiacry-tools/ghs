@@ -1,80 +1,67 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/bash
 set -euo pipefail
+
+for cmd in gh jq fzf; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "ghs: requires $cmd" >&2; exit 1; }
+done
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ghs"
 CACHE_TTL=300
 fzf_data=$(mktemp "${TMPDIR:-/tmp}/ghs_XXXXXX")
+trap 'rm -f "$fzf_data"' EXIT
 
 [ $# -ge 1 ] || { echo "Usage: ghs <term1> [term2] ..." >&2; exit 1; }
 
 terms=("$@")
 IFS=$'\n' sorted=($(sort <<<"${terms[*]}")); unset IFS
-cache_key=$(echo -n "${sorted[*]}" | md5sum | cut -d' ' -f1)
+cache_key=$(echo -n "${sorted[*]}" | md5 -q)
 cache_file="$CACHE_DIR/$cache_key.json"
 mkdir -p "$CACHE_DIR"
 
 now=$(date +%s)
-if [ -f "$cache_file" ]; then
-  mod=$(stat -c %Y "$cache_file")
+mod=$(stat -f %m "$cache_file" 2>/dev/null) || age=$((CACHE_TTL + 1))
+if [ -n "$mod" ]; then
   age=$((now - mod))
 else
   age=$((CACHE_TTL + 1))
 fi
 
+find "$CACHE_DIR" -type f -mmin +$((CACHE_TTL / 60)) -delete 2>/dev/null || true
+
 if [ "$age" -gt "$CACHE_TTL" ]; then
   combined='[]'
-
-  # Combined query: catches repos with ALL terms as whole tokens (GitHub native AND)
-  if [ "${#terms[@]}" -gt 1 ]; then
-    result=$(gh search repos "${terms[@]}" --sort stars --limit 200 \
-      --json fullName,description,url,stargazersCount,pushedAt 2>/dev/null || echo '[]')
-    combined=$(jq -s 'add' <(echo "$combined") <(echo "$result"))
-  fi
-
-  # Per-term queries: catches repos where terms appear inside compound words
   for term in "${terms[@]}"; do
     result=$(gh search repos "$term" --sort stars --limit 200 \
-      --json fullName,description,url,stargazersCount,pushedAt 2>/dev/null || echo '[]')
+      --json fullName,description,url,stargazersCount,pushedAt || echo '[]')
     combined=$(jq -s 'add' <(echo "$combined") <(echo "$result"))
   done
-  echo "$combined" | jq 'unique_by(.url)' > "$cache_file"
+  echo "$combined" | jq 'unique_by(.url)' > "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file"
 fi
 
-jq_args=$(printf '"%s",' "${terms[@]}")
-jq_args="[${jq_args%,}]"
+jq -c '.[]' "$cache_file" | while read -r repo; do
+  fullName=$(jq -r '.fullName' <<<"$repo")
+  desc=$(jq -r '.description // ""' <<<"$repo")
+  stars=$(jq -r '.stargazersCount' <<<"$repo")
+  pushed=$(jq -r '.pushedAt' <<<"$repo")
+  url=$(jq -r '.url' <<<"$repo")
 
-jq --argjson terms "$jq_args" -r '
-  [.[] | select(
-    ([.fullName, .description] | join(" ") | ascii_downcase) as $text
-    | (reduce $terms[] as $t (true; . and ($text | contains($t))))
-  )]
-  | sort_by(
-      if .stargazersCount > 1 and .pushedAt >= "2025-01-01" then 0
-      elif .stargazersCount > 1 then 1
-      elif .pushedAt >= "2025-01-01" then 2
-      else 3 end,
-      -.stargazersCount
-    )
-  | .[:100]
-  | to_entries[]
-  | "  #\(.key+1)  ★\(.value.stargazersCount)  \(.value.fullName)  \(.value.description // "")\t\(.value.url)"
-' "$cache_file" > "$fzf_data"
-
-trap 'rm -f "$fzf_data"' EXIT
-
-if [ ! -s "$fzf_data" ]; then
-  echo "ghs: no repos match all terms: ${terms[*]}" >&2
-  exit 1
-fi
-
-if [ ! -t 1 ] || ! command -v fzf >/dev/null 2>&1; then
-  cut -f1 "$fzf_data"
-  exit 0
-fi
+  text=$(echo "$fullName $desc" | tr '[:upper:]' '[:lower:]')
+  match_all=0
+  for term in "${terms[@]}"; do
+    term_lower=$(echo "$term" | tr '[:upper:]' '[:lower:]')
+    if [[ "$text" == *"$term_lower"* ]]; then
+      ((match_all++))
+    fi
+  done
+  [ "$match_all" -eq "${#terms[@]}" ] || continue
+  [ "$stars" -gt 1 ] || continue
+  [[ "$pushed" > "2025-01-01" || "$pushed" == "2025-01-01" ]] || continue
+  echo "$stars|$fullName|$desc|$url"
+done | sort -t'|' -k1 -rn | head -100 | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data"
 
 while true; do
   selected=$(fzf --ansi --with-nth=1..4 < "$fzf_data")
   [ -n "$selected" ] || break
   url=$(echo "$selected" | awk -F'\t' '{print $2}')
-  gh repo view --web "$url" 2>/dev/null || termux-open-url "$url" 2>/dev/null || true
+  gh repo view --web "$url" 2>/dev/null || open "$url" 2>/dev/null || true
 done
