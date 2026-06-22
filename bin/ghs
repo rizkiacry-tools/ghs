@@ -8,11 +8,14 @@ done
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ghs"
 CACHE_TTL=300
 fzf_data=$(mktemp "${TMPDIR:-/tmp}/ghs_XXXXXX")
-trap 'rm -f "$fzf_data"' EXIT
+data_file=""
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ghs_cleanup_XXXXXX")
+trap 'rm -rf "$fzf_data" "$temp_dir"' EXIT
 
 pipe_mode=0
 json_mode=0
 verbose=0
+use_cache=0
 limit=100
 min_stars=1
 since="2025-01-01"
@@ -23,25 +26,27 @@ i=0
 while [ $i -lt $# ]; do
   a="${@:$((i+1)):1}"
   case "$a" in
-    --pipe|--no-fzf) pipe_mode=1 ;;
-    --flag) pipe_mode=1 ;;
-    --json) json_mode=1 ;;
+    --pipe|--no-fzf|-p) pipe_mode=1 ;;
+
+    --json|-j) json_mode=1 ;;
+    --cache|-c) use_cache=1 ;;
     --verbose|-v) verbose=1 ;;
     --help|-h) echo "Usage: ghs [options] <term1> [term2] ..."
               echo "Options:"
-              echo "  --flag, --pipe, --no-fzf   Print results to stdout (skip fzf)"
-              echo "  --json                     Print raw JSON"
-              echo "  -v, --verbose              Show search status on stderr"
-              echo "  --limit N                  Max results (default 100)"
-              echo "  --stars N                  Min stars filter (default 1)"
-              echo "  --since DATE               Push date filter (default 2025-01-01)"
-              echo "  --sort FIELD               Sort: stars/updated/forks (default stars)"
-              echo "  -h, --help                 This help"
+              echo "  -p, --pipe, --no-fzf   Print results to stdout (skip fzf)"
+              echo "  -c, --cache                    Cache search results (default: no cache)"
+              echo "  -j, --json                     Print raw JSON"
+              echo "  -v, --verbose                  Show search status on stderr"
+              echo "  -n, --limit N                  Max results (default 100)"
+              echo "  -s, --stars N                  Min stars filter (default 1)"
+              echo "  -d, --since DATE               Push date filter (default 2025-01-01)"
+              echo "  -o, --sort FIELD               Sort: stars/updated/forks (default stars)"
+              echo "  -h, --help                     This help"
               exit 0 ;;
-    --limit) limit="${@:$((i+2)):1}"; i=$((i+1)) ;;
-    --stars) min_stars="${@:$((i+2)):1}"; i=$((i+1)) ;;
-    --since) since="${@:$((i+2)):1}"; i=$((i+1)) ;;
-    --sort) sort_field="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --limit|-n) limit="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --stars|-s) min_stars="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --since|-d) since="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --sort|-o) sort_field="${@:$((i+2)):1}"; i=$((i+1)) ;;
     --*) echo "ghs: unknown flag $a" >&2; exit 1 ;;
     *) terms+=("$a") ;;
   esac
@@ -49,27 +54,32 @@ while [ $i -lt $# ]; do
 done
 
 [ ${#terms[@]} -ge 1 ] || { echo "ghs: at least one search term required" >&2; exit 1; }
-IFS=$'\n' sorted=($(sort <<<"${terms[*]}")); unset IFS
-cache_key=$(echo -n "${sorted[*]}" | md5 -q)
-cache_file="$CACHE_DIR/$cache_key.json"
-mkdir -p "$CACHE_DIR"
-
-now=$(date +%s)
-mod=$(stat -f %m "$cache_file" 2>/dev/null) || age=$((CACHE_TTL + 1))
-if [ -n "$mod" ]; then
-  age=$((now - mod))
-else
-  age=$((CACHE_TTL + 1))
-fi
-
 find "$CACHE_DIR" -type f -mmin +$((CACHE_TTL / 60)) -delete 2>/dev/null || true
 
 SEARCH_LIMIT=500
 t0=$(date +%s)
 v() { [ "$verbose" -eq 1 ] && echo "ghs: $*" >&2; true; }
 
-if [ "$age" -gt "$CACHE_TTL" ]; then
-  v "cache miss, searching..."
+if [ "$use_cache" -eq 1 ]; then
+  IFS=$'\n' sorted=($(sort <<<"${terms[*]}")); unset IFS
+  cache_key=$(echo -n "${sorted[*]}" | md5 -q)
+  cache_file="$CACHE_DIR/$cache_key.json"
+  mkdir -p "$CACHE_DIR"
+  now=$(date +%s)
+  mod=$(stat -f %m "$cache_file" 2>/dev/null) || age=$((CACHE_TTL + 1))
+  if [ -n "$mod" ]; then
+    age=$((now - mod))
+  else
+    age=$((CACHE_TTL + 1))
+  fi
+fi
+
+if [ "$use_cache" -eq 1 ] && [ "$age" -le "$CACHE_TTL" ]; then
+  unique=$(jq length "$cache_file" 2>/dev/null || echo 0)
+  v "cache hit, $unique repos (age $(($(date +%s)-$(stat -f %m "$cache_file" 2>/dev/null || echo $((now-1)))))s)"
+  data_file="$cache_file"
+else
+  [ "$use_cache" -eq 1 ] && v "cache miss, searching..."
   combined='[]'
   for term in "${terms[@]}"; do
     result=$(gh search repos "$term" --sort "$sort_field" --limit "$SEARCH_LIMIT" \
@@ -79,40 +89,45 @@ if [ "$age" -gt "$CACHE_TTL" ]; then
     combined=$(jq -s 'add' <(echo "$combined") <(echo "$result"))
   done
   unique=$(echo "$combined" | jq 'unique_by(.url) | length')
-  echo "$combined" | jq 'unique_by(.url)' > "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file"
+  if [ "$use_cache" -eq 1 ]; then
+    echo "$combined" | jq 'unique_by(.url)' > "$cache_file.tmp" && mv "$cache_file.tmp" "$cache_file"
+    data_file="$cache_file"
+  else
+    data_file="$temp_dir/data.json"
+    echo "$combined" | jq 'unique_by(.url)' > "$data_file"
+  fi
   v "combined → $unique unique repos ($(($(date +%s)-t0))s)"
-else
-  unique=$(jq length "$cache_file" 2>/dev/null || echo 0)
-  v "cache hit, $unique repos (age $(($(date +%s)-$(stat -f %m "$cache_file" 2>/dev/null || echo $((now-1)))))s)"
 fi
 
+n_total=0; n_and=0; n_stars=0; n_date=0; n_pass=0
 t1=$(date +%s)
-jq -c '.[]' "$cache_file" | while read -r repo; do
-  fullName=$(jq -r '.fullName' <<<"$repo")
+jq -c '.[]' "$data_file" | while read -r repo; do
+  fn=$(jq -r '.fullName' <<<"$repo")
   desc=$(jq -r '.description // ""' <<<"$repo")
   stars=$(jq -r '.stargazersCount' <<<"$repo")
   pushed=$(jq -r '.pushedAt' <<<"$repo")
   url=$(jq -r '.url' <<<"$repo")
-
-  text=$(echo "$fullName $desc" | tr '[:upper:]' '[:lower:]')
-  match_all=0
+  txt=$(echo "$fn $desc" | tr '[:upper:]' '[:lower:]')
+  ma=0
   for term in "${terms[@]}"; do
-    term_lower=$(echo "$term" | tr '[:upper:]' '[:lower:]')
-    if [[ "$text" == *"$term_lower"* ]]; then
-      ((match_all++))
-    fi
+    tl=$(echo "$term" | tr '[:upper:]' '[:lower:]')
+    [[ "$txt" == *"$tl"* ]] && ((ma++))
   done
-  [ "$match_all" -eq "${#terms[@]}" ] || continue
-  [ "$stars" -gt "$min_stars" ] || continue
-  [[ "$pushed" > "$since" || "$pushed" == "$since" ]] || continue
-  echo "$stars|$fullName|$desc|$url"
-done | sort -t'|' -k1 -rn | head -"$limit" | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data"
+  r_and=✗; r_stars=✗; r_date=✗
+  [ "$ma" -eq "${#terms[@]}" ] && r_and=✓
+  [ "$stars" -gt "$min_stars" ] && r_stars=✓
+  [[ "$pushed" > "$since" || "$pushed" == "$since" ]] && r_date=✓
+  [ "$verbose" -eq 1 ] && printf "ghs:  %-42s AND %s stars %s date %s\n" "$fn" "$r_and" "$r_stars" "$r_date" >&2
+  [ "$r_and" = ✗ ] || [ "$r_stars" = ✗ ] || [ "$r_date" = ✗ ] && continue
+  echo "$stars|$fn|$desc|$url"
+done | sort -t'|' -k1 -rn | head -"$limit" | awk -F'|' '{n++; printf "  #%d  ★%s  %s  %s\t%s\n", n, $1, $2, $3, $4}' > "$fzf_data" &
+pid=$!
+wait "$pid" 2>/dev/null
 fzfc=$(wc -l < "$fzf_data" 2>/dev/null | tr -d ' ') || fzfc=0
-v "filtered → $fzfc results ($(($(date +%s)-t1))s)"
-v "total $(($(date +%s)-t0))s"
+[ "$verbose" -eq 1 ] && echo "ghs: results: $fzfc repos passed ($(($(date +%s)-t1))s)" >&2
 
 if [ "$json_mode" -eq 1 ]; then
-  cat "$cache_file"
+  cat "$data_file"
 elif [ "$pipe_mode" -eq 1 ]; then
   awk -F'\t' '{print $1}' "$fzf_data"
 else
