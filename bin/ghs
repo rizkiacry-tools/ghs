@@ -15,7 +15,7 @@ trap 'rm -rf "$fzf_data" "$temp_dir"' EXIT
 pipe_mode=0
 json_mode=0
 verbose=0
-use_cache=0
+use_cache=1
 limit=100
 min_stars=1
 since="2025-01-01"
@@ -29,12 +29,12 @@ while [ $i -lt $# ]; do
     --pipe|--no-fzf|-p) pipe_mode=1 ;;
 
     --json|-j) json_mode=1 ;;
-    --cache|-c) use_cache=1 ;;
+    --no-cache) use_cache=0 ;;
     --verbose|-v) verbose=1 ;;
     --help|-h) echo "Usage: ghs [options] <term1> [term2] ..."
               echo "Options:"
               echo "  -p, --pipe, --no-fzf   Print results to stdout (skip fzf)"
-              echo "  -c, --cache                    Cache search results (default: no cache)"
+              echo "  --no-cache                    Skip cache, always fetch fresh"
               echo "  -j, --json                     Print raw JSON"
               echo "  -v, --verbose                  Show search status on stderr"
               echo "  -n, --limit N                  Max results (default 100)"
