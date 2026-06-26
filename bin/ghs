@@ -20,6 +20,7 @@ limit=100
 min_stars=1
 since="2025-01-01"
 sort_field="stars"
+search_limit=500
 terms=()
 
 i=0
@@ -41,12 +42,14 @@ while [ $i -lt $# ]; do
               echo "  -s, --stars N                  Min stars filter (default 1)"
               echo "  -d, --since DATE               Push date filter (default 2025-01-01)"
               echo "  -o, --sort FIELD               Sort: stars/updated/forks (default stars)"
+              echo "  -l, --search-limit N           Max repos fetched per term from API (default 500)"
               echo "  -h, --help                     This help"
               exit 0 ;;
     --limit|-n) limit="${@:$((i+2)):1}"; i=$((i+1)) ;;
     --stars|-s) min_stars="${@:$((i+2)):1}"; i=$((i+1)) ;;
     --since|-d) since="${@:$((i+2)):1}"; i=$((i+1)) ;;
     --sort|-o) sort_field="${@:$((i+2)):1}"; i=$((i+1)) ;;
+    --search-limit|-l) search_limit="${@:$((i+2)):1}"; i=$((i+1)) ;;
     --*) echo "ghs: unknown flag $a" >&2; exit 1 ;;
     *) terms+=("$a") ;;
   esac
@@ -56,7 +59,7 @@ done
 [ ${#terms[@]} -ge 1 ] || { echo "ghs: at least one search term required" >&2; exit 1; }
 find "$CACHE_DIR" -type f -mmin +$((CACHE_TTL / 60)) -delete 2>/dev/null || true
 
-SEARCH_LIMIT=500
+SEARCH_LIMIT=$search_limit
 t0=$(date +%s)
 v() { [ "$verbose" -eq 1 ] && echo "ghs: $*" >&2; true; }
 
